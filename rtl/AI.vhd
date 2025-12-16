@@ -74,29 +74,18 @@ architecture arch of AI is
    signal state               : tState := IDLE;
          
    signal dataNext            : std_logic_vector(63 downto 0);
+   signal dataValid           : std_logic := '0';
    signal validCnt            : integer range 0 to 15 := 0;
    
    -- clock domain crossing
    signal fifo_nearfull_clk1x : std_logic_vector(3 downto 0);
-
-   signal data_buf            : std_logic_vector(63 downto 0) := (others => '0');
-   signal data_req            : std_logic := '0';
-   signal data_req_sync1      : std_logic := '0';
-   signal data_req_sync2      : std_logic := '0';
-   signal data_ack            : std_logic := '0';
-   signal data_ack_sync1      : std_logic := '0';
-   signal data_ack_sync2      : std_logic := '0';
-   signal data_pending        : std_logic := '0';
-
-   signal dacrate_sync1       : unsigned(13 downto 0) := (others => '0');
-   signal dacrate_sync2       : unsigned(13 downto 0) := (others => '0');
+   
+   signal dataValid_clkvid    : std_logic_vector(3 downto 0);
       
    -- clk vid signals   
    signal waittime            : unsigned(14 downto 0) := (others => '0');
+   signal fifo_next           : std_logic := '0';
    signal soundFifoTimeout    : integer range 0 to 2047 := 0;
-   signal data_payload        : std_logic_vector(63 downto 0) := (others => '0');
-   signal word_phase          : std_logic := '0';
-   signal write_pending       : std_logic := '0';
          
    signal fifo_Din            : std_logic_vector(31 downto 0);
    signal fifo_wr             : std_logic := '0';
@@ -145,23 +134,14 @@ begin
             carry                <= ss_in(1)(43); --'0';
             fillcount            <= to_integer(unsigned(ss_in(1)(45 downto 44))); -- 0 
             state                <= IDLE;
-            data_req             <= '0';
-            data_pending         <= '0';
-            data_ack_sync1       <= '0';
-            data_ack_sync2       <= '0';
-            data_buf             <= (others => '0');
+            
+            dataValid            <= '0';
             
          elsif (ce = '1') then
          
             bus_done     <= '0';
             bus_dataRead <= (others => '0');
             
-            data_ack_sync1 <= data_ack;
-            data_ack_sync2 <= data_ack_sync1;
-            if (data_pending = '1' and data_ack_sync2 = data_req) then
-               data_pending <= '0';
-            end if;
-
             if (bus_read = '1') then
                bus_read_latch <= '1';
             end if;            
@@ -243,7 +223,7 @@ begin
                      irq_out      <= not DISABLE_AI_IRQ;
                   end if;
                   fillcount <= fillcount - 1;
-                     
+                  
                when FETCHNEXT =>
                   if (rdram_done = '1') then
                      state     <= FETCHNEXT2;
@@ -252,12 +232,11 @@ begin
                   end if;
                   
                when FETCHNEXT2 => 
-                  if (validCnt = 12 and data_pending = '0' and data_ack_sync2 = data_req) then -- delay valid for some cycles, so dataNext is stable before crossing domains
-                     data_buf       <= dataNext;
-                     data_req       <= not data_req;
-                     data_pending   <= '1';
+                  if (validCnt = 12) then -- delay valid for some cycles, so dataNext is stable and doesn't need CDC                  
+                     dataValid <= '1';
                   end if;
                   if (validCnt = 0) then
+                     dataValid <= '0';
                   
                      AI_DRAM_ADDR(12 downto 0) <= AI_DRAM_ADDR(12 downto 0) + 8;
                      carry <= '0';
@@ -285,100 +264,71 @@ begin
       variable soundSignedR : signed(15 downto 0);
    begin
       if rising_edge(clkvid) then
-
-         if (reset = '1') then
-
-            fifo_wr        <= '0';
-            fifo_rd        <= '0';
-            write_pending  <= '0';
-            word_phase     <= '0';
-            data_req_sync1 <= '0';
-            data_req_sync2 <= '0';
-            data_ack       <= '0';
-            data_payload   <= (others => '0');
-            dacrate_sync1  <= (others => '0');
-            dacrate_sync2  <= (others => '0');
-            waittime       <= (others => '0');
-            soundFifoTimeout <= 0;
-
-         else
+      
+         fifo_wr   <= '0';
+         fifo_rd   <= '0';
+         fifo_next <= '0';
+      
+         dataValid_clkvid <= dataValid_clkvid(2 downto 0) & dataValid;
          
-            fifo_wr   <= '0';
-            fifo_rd   <= '0';
-            
-            dacrate_sync1 <= AI_DACRATE;
-            dacrate_sync2 <= dacrate_sync1;
-
-            data_req_sync1 <= data_req;
-            data_req_sync2 <= data_req_sync1;
-
-            -- capture a new 64-bit word from clk1x when request toggle changes
-            if (data_req_sync2 /= data_ack) then
-               data_payload <= data_buf;
-               write_pending <= '1';
-               word_phase <= '0';
-               data_ack <= data_req_sync2;
-            end if;
-
-            -- fifo fill: write two 32-bit words when pending
-            if (write_pending = '1') then
-               fifo_wr  <= '1';
-               if (word_phase = '0') then
-                  fifo_Din  <= data_payload(31 downto 0);
-                  word_phase <= '1';
-               else
-                  fifo_Din  <= data_payload(63 downto 32);
-                  write_pending <= '0';
-               end if;
-            end if;
-            
-            -- timing for readout
-            waittime <= waittime - 1;
-            if (waittime = 0) then
-            
-               waittime <= resize(dacrate_sync2, waittime'length) + 1; -- resynchronized
-               if (dacrate_sync2 < 16#200#) then
-                  waittime <= 15x"200"; 
-               end if;
-               
-               if (fifo_Empty = '0') then
-               
-                  fifo_Rd          <= '1';
-                  soundFifoTimeout <= 0;
-
-                  soundSignedL := signed(fifo_Dout( 7 downto  0)) & signed(fifo_Dout(15 downto  8));
-                  soundSignedR := signed(fifo_Dout(23 downto 16)) & signed(fifo_Dout(31 downto 24));
-                  
-                  if (soundSignedL = -32768) then soundSignedL := to_signed(32767, 16); else soundSignedL := -soundSignedL; end if;
-                  if (soundSignedR = -32768) then soundSignedR := to_signed(32767, 16); else soundSignedR := -soundSignedR; end if;
-                  
-                  sound_out_left  <= std_logic_vector(soundSignedL);
-                  sound_out_right <= std_logic_vector(soundSignedR);
-
-               elsif (soundFifoTimeout < 2047) then
-                  soundFifoTimeout <= soundFifoTimeout + 1;
-               else
-               
-                  if (signed(sound_out_left) <= -16) then 
-                     sound_out_left <= std_logic_vector(signed(sound_out_left) + 16);
-                  elsif (signed(sound_out_left) >= 16) then
-                     sound_out_left <= std_logic_vector(signed(sound_out_left) - 16);
-                  else
-                     sound_out_left  <= (others => '0');
-                  end if;
-                  
-                  if (signed(sound_out_right) <= -16) then 
-                     sound_out_right <= std_logic_vector(signed(sound_out_right) + 16);
-                  elsif (signed(sound_out_right) >= 16) then
-                     sound_out_right <= std_logic_vector(signed(sound_out_right) - 16);
-                  else
-                     sound_out_right  <= (others => '0');
-                  end if;
-                  
-               end if;  
-            end if;
-         
+         -- fifo fill
+         if (dataValid_clkvid(3) = '0' and dataValid_clkvid(2) = '1') then
+            fifo_wr   <= '1';
+            fifo_Din  <= dataNext(31 downto 0);
+            fifo_next <= '1';
          end if;
+         
+         if (fifo_next = '1') then
+            fifo_wr   <= '1';
+            fifo_Din  <= dataNext(63 downto 32);
+         end if;
+         
+         -- timing for readout
+         waittime <= waittime - 1;
+         if (waittime = 0) then
+         
+            waittime <= resize(AI_DACRATE, waittime'length) + 1; -- no clock domain crossing, should not change while playing sound
+            if (AI_DACRATE < 16#200#) then
+               waittime <= 15x"200"; 
+            end if;
+            
+            if (fifo_Empty = '0') then
+            
+               fifo_Rd          <= '1';
+               soundFifoTimeout <= 0;
+
+               soundSignedL := signed(fifo_Dout( 7 downto  0)) & signed(fifo_Dout(15 downto  8));
+               soundSignedR := signed(fifo_Dout(23 downto 16)) & signed(fifo_Dout(31 downto 24));
+               
+               if (soundSignedL = -32768) then soundSignedL := to_signed(32767, 16); else soundSignedL := -soundSignedL; end if;
+               if (soundSignedR = -32768) then soundSignedR := to_signed(32767, 16); else soundSignedR := -soundSignedR; end if;
+               
+               sound_out_left  <= std_logic_vector(soundSignedL);
+               sound_out_right <= std_logic_vector(soundSignedR);
+
+            elsif (soundFifoTimeout < 2047) then
+               soundFifoTimeout <= soundFifoTimeout + 1;
+            else
+            
+               if (signed(sound_out_left) <= -16) then 
+                  sound_out_left <= std_logic_vector(signed(sound_out_left) + 16);
+               elsif (signed(sound_out_left) >= 16) then
+                  sound_out_left <= std_logic_vector(signed(sound_out_left) - 16);
+               else
+                  sound_out_left  <= (others => '0');
+               end if;
+               
+               if (signed(sound_out_right) <= -16) then 
+                  sound_out_right <= std_logic_vector(signed(sound_out_right) + 16);
+               elsif (signed(sound_out_right) >= 16) then
+                  sound_out_right <= std_logic_vector(signed(sound_out_right) - 16);
+               else
+                  sound_out_right  <= (others => '0');
+               end if;
+               
+            end if;  
+         end if;
+         
       end if;
    end process;
    
@@ -481,3 +431,8 @@ begin
    -- synthesis translate_on  
 
 end architecture;
+
+
+
+
+
